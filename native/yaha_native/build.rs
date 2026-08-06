@@ -31,7 +31,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
-    if target_os == "windows" {
+    // winres shells out to the Windows SDK's rc.exe, which only exists on a Windows host.
+    // Skipping it when cross-compiling from Linux/macOS keeps `cargo xwin build` working;
+    // the resource is still embedded by the Windows CI runners that build the shipped DLL.
+    if target_os == "windows" && cfg!(target_os = "windows") {
         let res = winres::WindowsResource::new();
         res.compile().unwrap();
     }

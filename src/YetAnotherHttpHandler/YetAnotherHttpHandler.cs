@@ -101,7 +101,16 @@ namespace Cysharp.Net.Http
         /// <see href="https://docs.rs/hyper-util/latest/hyper_util/client/legacy/struct.Builder.html#method.http2_max_frame_size">hyper: http2_max_frame_size</see>
         /// </remarks>
         public uint? Http2MaxFrameSize { get => _settings.Http2MaxFrameSize; set => _settings.Http2MaxFrameSize = value; }
-        
+
+        /// <summary>
+        /// Gets or sets the max size of received header frames for HTTP2.
+        /// Default is currently 16KB, but can change.
+        /// </summary>
+        /// <remarks>
+        /// <see href="https://docs.rs/hyper-util/latest/hyper_util/client/legacy/struct.Builder.html#method.http2_max_header_list_size">hyper: http2_max_header_list_size</see>
+        /// </remarks>
+        public uint? Http2MaxHeaderListSize { get => _settings.Http2MaxHeaderListSize; set => _settings.Http2MaxHeaderListSize = value; }
+
         /// <summary>
         /// Gets or sets timeout for TCP connection establishment
         /// Pass <value>null</value> to never timeout.
@@ -252,6 +261,7 @@ namespace Cysharp.Net.Http
         public uint? Http2InitialConnectionWindowSize { get; set; }
         public bool? Http2AdaptiveWindow { get; set; }
         public uint? Http2MaxFrameSize { get; set; }
+        public uint? Http2MaxHeaderListSize { get; set; }
         public TimeSpan? ConnectTimeout { get; set; }
         public TimeSpan? Http2KeepAliveInterval { get; set; }
         public TimeSpan? Http2KeepAliveTimeout { get; set; }
@@ -279,6 +289,7 @@ namespace Cysharp.Net.Http
                 Http2InitialConnectionWindowSize = this.Http2InitialConnectionWindowSize,
                 Http2AdaptiveWindow = this.Http2AdaptiveWindow,
                 Http2MaxFrameSize = this.Http2MaxFrameSize,
+                Http2MaxHeaderListSize = this.Http2MaxHeaderListSize,
                 ConnectTimeout = this.ConnectTimeout,
                 Http2KeepAliveInterval = this.Http2KeepAliveInterval,
                 Http2KeepAliveTimeout = this.Http2KeepAliveTimeout,

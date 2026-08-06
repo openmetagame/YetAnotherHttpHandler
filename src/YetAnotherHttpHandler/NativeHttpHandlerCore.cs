@@ -156,6 +156,11 @@ namespace Cysharp.Net.Http
                 if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Info($"Option '{nameof(settings.Http2MaxFrameSize)}' = {http2MaxFrameSize}");
                 NativeMethods.yaha_client_config_http2_max_frame_size(ctx, http2MaxFrameSize);
             }
+            if (settings.Http2MaxHeaderListSize is { } http2MaxHeaderListSize)
+            {
+                if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Info($"Option '{nameof(settings.Http2MaxHeaderListSize)}' = {http2MaxHeaderListSize}");
+                NativeMethods.yaha_client_config_http2_max_header_list_size(ctx, http2MaxHeaderListSize);
+            }
             if (settings.ConnectTimeout is { } connectTimeout)
             {
                 if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Info($"Option '{nameof(settings.ConnectTimeout)}' = {connectTimeout}");

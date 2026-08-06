@@ -36,7 +36,8 @@ hyper-rustls = { optional = true, version = "0.26.0", default-features = false, 
 rustls = { optional = true, version = "0.22.4" }
 rustls-pemfile = { optional = true, version = "2.1.2" }
 hyper-tls = { optional = true, version = "0.6.0" }
-hyper-util = { version = "0.1.5", features = ["client", "http1", "http2", "client-legacy"] }
+# 0.1.10 is the first release whose legacy client Builder exposes http2_max_header_list_size.
+hyper-util = { version = "0.1.10", features = ["client", "http1", "http2", "client-legacy"] }
 http-body-util = "0.1.1"
 tokio-stream = "0.1.15"
 futures-channel = "0.3.30"

@@ -258,6 +258,18 @@ pub extern "C" fn yaha_client_config_http2_max_frame_size(ctx: *mut YahaNativeCo
 }
 
 #[no_mangle]
+pub extern "C" fn yaha_client_config_http2_max_header_list_size(
+    ctx: *mut YahaNativeContext,
+    val: u32,
+) {
+    let ctx = YahaNativeContextInternal::from_raw_context(ctx);
+    ctx.client_builder
+        .as_mut()
+        .unwrap()
+        .http2_max_header_list_size(val);
+}
+
+#[no_mangle]
 pub extern "C" fn yaha_client_config_http2_keep_alive_interval(
     ctx: *mut YahaNativeContext,
     interval_milliseconds: u64,

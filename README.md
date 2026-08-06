@@ -223,6 +223,7 @@ Once the handler sends a request, these settings become immutable and cannot be 
 |Http2InitialConnectionWindowSize|Gets or sets the max connection-level flow control for HTTP2|
 |Http2AdaptiveWindow|Gets or sets whether to use an adaptive flow control. Enabling this will override the limits set in http2_initial_stream_window_size and http2_initial_connection_window_size.|
 |Http2MaxFrameSize|Gets or sets the maximum frame size to use for HTTP2.|
+|Http2MaxHeaderListSize|Gets or sets the max size of received header frames for HTTP2. Default is currently 16KB, but can change.|
 |ConnectTimeout|Gets or sets timeout for TCP connection establishment. Pass null to never timeout. Default is never timeout.|
 |Http2KeepAliveInterval|Gets or sets an interval for HTTP2 Ping frames should be sent to keep a connection alive. Pass <value>null</value> to disable HTTP2 keep-alive. Default is currently disabled.|
 |Http2KeepAliveTimeout|Gets or sets a timeout for receiving an acknowledgement of the keep-alive ping. If the ping is not acknowledged within the timeout, the connection will be closed. Does nothing if http2_keep_alive_interval is disabled. Default is 20 seconds.|
