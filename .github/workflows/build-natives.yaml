@@ -511,8 +511,14 @@ jobs:
           name: nuget-packages
           path: ./publish/
       - run: unzip -o ./publish/YetAnotherHttpHandler.*[0-9].nupkg 'runtimes/*' -d src/YetAnotherHttpHandler/Plugins/Cysharp.Net.Http.YetAnotherHttpHandler.Native/ || true
-      - run: |
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git commit -m "Update pre-built native libraries" src/YetAnotherHttpHandler/Plugins/**/*
-          git push origin ${{ github.ref_name }}
+          # Cysharp/Actions' checkout forces `persist-credentials: false`, so the local git config has
+          # no credentials and a plain `git push origin` fails with "could not read Username".
+          # Authenticate this one push explicitly with the job's GITHUB_TOKEN (permissions: contents: write).
+          # The token is passed via env rather than inlined so it is not expanded into the run script.
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"

@@ -497,13 +497,25 @@ pub extern "C" fn yaha_request_begin(
     {
         let mut req_ctx = req_ctx.lock().unwrap();
 
-        let (tx, rx) = futures_channel::mpsc::channel::<Bytes>(0);
-        body = BoxBody::new(http_body_util::StreamBody::new(rx.map(|data| Result::Ok(Frame::data(data)))));
-        
         if req_ctx.has_body {
+            let (tx, rx) = futures_channel::mpsc::channel::<Bytes>(0);
+            body = BoxBody::new(http_body_util::StreamBody::new(rx.map(|data| Result::Ok(Frame::data(data)))));
             req_ctx.sender = Some(tx);
         } else {
-            drop(tx); // close
+            // Use a genuinely empty body rather than an immediately-closed stream.
+            //
+            // A StreamBody reports `is_end_stream() == false` and an unbounded `size_hint()`, so hyper
+            // cannot tell the request has no body: it omits END_STREAM from the HEADERS frame and has
+            // to terminate the stream afterwards with an empty DATA frame, or with RST_STREAM if the
+            // response completed first. That doubles the frames per bodyless request and leaves the
+            // stream open longer, which trips HTTP/2 servers that bound how many streams they track
+            // (Kestrel refuses new streams with ENHANCE_YOUR_CALM past MaxTrackedStreams).
+            //
+            // `Empty` reports end-of-stream up front, so hyper sets END_STREAM on HEADERS and the
+            // request is a single frame, matching SocketsHttpHandler.
+            // `Empty`'s error type is `Infallible`; the empty match widens it to `hyper::Error`
+            // without introducing a panic path, since `Infallible` has no variants.
+            body = BoxBody::new(http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}));
         }
     }
     {
