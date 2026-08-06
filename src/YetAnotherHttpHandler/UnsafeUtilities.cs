@@ -9,6 +9,17 @@ namespace Cysharp.Net.Http
 {
     internal static class UnsafeUtilities
     {
+        /// <summary>
+        /// The name the native runtime gives to every tokio worker thread.
+        /// </summary>
+        /// <remarks>
+        /// This must stay in sync with <c>WORKER_THREAD_NAME</c> in
+        /// <c>native/yaha_native/src/context.rs</c>. It is pinned on the Rust side rather than taken
+        /// from tokio's default, because tokio renamed that default (1.38 "tokio-runtime-worker" ->
+        /// "tokio-rt-worker") and silently broke every check below.
+        /// </remarks>
+        public const string WorkerThreadName = "yaha-rt-worker";
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public unsafe static string GetStringFromUtf8Bytes(ReadOnlySpan<byte> bytes)
         {
@@ -70,7 +81,7 @@ namespace Cysharp.Net.Http
             }
 
             var threadName = GetCurrentThreadName();
-            if (threadName == "tokio-runtime-worker")
+            if (threadName == WorkerThreadName)
             {
                 Environment.FailFast($"The current thread is the tokio worker thread.");
             }

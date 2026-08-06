@@ -155,7 +155,7 @@ public class YetAnotherHttpHandlerTest(ITestOutputHelper testOutputHelper) : Use
         // Pre-condition
         Assert.Equal(0, NativeRuntime.Instance._refCount);
         {
-            var tokioThreads = ThreadEnumerator.GetThreadsWithNames(Process.GetCurrentProcess().Id).Count(x => x.ThreadName.Contains("tokio-runtime-worker"));
+            var tokioThreads = ThreadEnumerator.GetThreadsWithNames(Process.GetCurrentProcess().Id).Count(x => x.ThreadName.Contains(UnsafeUtilities.WorkerThreadName));
             Assert.Equal(0, tokioThreads);
         }
 
@@ -181,7 +181,7 @@ public class YetAnotherHttpHandlerTest(ITestOutputHelper testOutputHelper) : Use
                 YetAnotherHttpHandler.SetWorkerThreads(null);
             }
 
-            var tokioThreads = ThreadEnumerator.GetThreadsWithNames(Process.GetCurrentProcess().Id).Count(x => x.ThreadName.Contains("tokio-runtime-worker"));
+            var tokioThreads = ThreadEnumerator.GetThreadsWithNames(Process.GetCurrentProcess().Id).Count(x => x.ThreadName.Contains(UnsafeUtilities.WorkerThreadName));
             Assert.Equal(workerThreads, tokioThreads);
         }
 
@@ -189,7 +189,7 @@ public class YetAnotherHttpHandlerTest(ITestOutputHelper testOutputHelper) : Use
         GC.WaitForPendingFinalizers();
 
         {
-            var tokioThreads = ThreadEnumerator.GetThreadsWithNames(Process.GetCurrentProcess().Id).Count(x => x.ThreadName.Contains("tokio-runtime-worker"));
+            var tokioThreads = ThreadEnumerator.GetThreadsWithNames(Process.GetCurrentProcess().Id).Count(x => x.ThreadName.Contains(UnsafeUtilities.WorkerThreadName));
             Assert.Equal(0, tokioThreads);
         }
 

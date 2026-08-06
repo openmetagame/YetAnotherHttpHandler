@@ -42,6 +42,10 @@ pub struct YahaNativeRuntimeContextInternal {
     pub runtime: Runtime
 }
 
+/// Name given to every tokio worker thread. The managed side matches on this exact string; see
+/// `UnsafeUtilities.WorkerThreadName`. Must stay <= 15 bytes (Linux thread-name limit).
+const WORKER_THREAD_NAME: &str = "yaha-rt-worker";
+
 impl YahaNativeRuntimeContextInternal {
     pub fn from_raw_context(ctx: *mut YahaNativeRuntimeContext) -> &'static mut Self {
         unsafe { &mut *(ctx as *mut Self) }
@@ -49,6 +53,18 @@ impl YahaNativeRuntimeContextInternal {
     pub fn new(worker_threads: i32) -> YahaNativeRuntimeContextInternal {
         let mut builder = Builder::new_multi_thread();
         let mut builder = builder.enable_all();
+
+        // Name the worker threads explicitly instead of inheriting tokio's default.
+        //
+        // The managed side identifies tokio worker threads by name: UnsafeUtilities
+        // .RequireRunningOnManagedThread fail-fasts if disposal runs on one, and the
+        // SetWorkerThreads test counts them. Relying on tokio's default silently broke both when
+        // tokio renamed it from "tokio-runtime-worker" to "tokio-rt-worker" (tokio #7880). Pinning it
+        // here keeps that contract in one place and survives future tokio releases.
+        //
+        // Keep this at 15 bytes or fewer: Linux truncates thread names at 15 (TASK_COMM_LEN - 1),
+        // which is the very limit that prompted tokio's rename.
+        builder = builder.thread_name(WORKER_THREAD_NAME);
 
         // Set the number of worker threads. If not larger than 0, use the default number of threads. (= number of cores)
         if worker_threads > 0 {

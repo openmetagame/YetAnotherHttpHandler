@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/perf/">
     <Project Path="perf/PerformanceCheck/PerformanceCheck.csproj" />
+    <Project Path="perf/YetAnotherHttpHandler.Benchmark/YetAnotherHttpHandler.Benchmark.csproj" />
   </Folder>
   <Folder Name="/Solution Items/">
     <File Path=".editorconfig" />
