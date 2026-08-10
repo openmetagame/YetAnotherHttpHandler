@@ -173,6 +173,26 @@ public class DnsResolverTest
         Assert.True(calls >= 2, "the resolver should have been consulted again before the cache was used");
     }
 
+    /// <summary>
+    /// A throwing resolver is treated as a failed lookup, so the cache fallback still applies. This
+    /// matters because a platform resolver that starts throwing is the realistic failure mode - an
+    /// Android JNI call blowing up after the network goes away, say.
+    /// </summary>
+    [Fact]
+    public async Task CacheFallback_ServesCachedAddressWhenTheResolverThrows()
+    {
+        using var server = RawTestServer.OkClosing("survived-throw");
+
+        var throwing = false;
+        using var client = CreateClient(_ =>
+            throwing ? throw new InvalidOperationException("resolver blew up") : [IPAddress.Loopback]);
+
+        Assert.Equal("survived-throw", await client.GetStringAsync(UriFor(server)));
+
+        throwing = true;
+        Assert.Equal("survived-throw", await client.GetStringAsync(UriFor(server)));
+    }
+
     [Fact]
     public async Task CacheFallback_Disabled_FailsWhenResolutionFails()
     {

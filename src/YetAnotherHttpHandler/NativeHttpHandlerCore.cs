@@ -23,8 +23,6 @@ namespace Cysharp.Net.Http
 
         //private unsafe YahaNativeContext* _ctx;
         private readonly YahaContextSafeHandle _handle;
-        private GCHandle? _onVerifyServerCertificateHandle; // The handle must be released in Dispose if it is allocated.
-        private GCHandle? _onResolveDnsHandle; // The handle must be released in Dispose if it is allocated.
         private bool _disposed = false;
         private PipeOptions? _responsePipeOptions;
 
@@ -89,20 +87,24 @@ namespace Cysharp.Net.Http
                 if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Info($"Option '{nameof(settings.OnVerifyServerCertificate)}' = {onVerifyServerCertificate}");
 
                 // NOTE: We need to keep the handle to call in the static callback method.
-                //       The handle must be released in Dispose if it is allocated.
-                _onVerifyServerCertificateHandle = GCHandle.Alloc(onVerifyServerCertificate);
+                //       Ownership is handed to the context handle, which frees it only once the
+                //       native context is gone - see YahaContextSafeHandle.AddCallbackState.
+                var callbackState = GCHandle.Alloc(onVerifyServerCertificate);
+                _handle.AddCallbackState(callbackState);
 
-                NativeMethods.yaha_client_config_set_server_certificate_verification_handler(ctx, OnServerCertificateVerificationCallback, GCHandle.ToIntPtr(_onVerifyServerCertificateHandle.Value));
+                NativeMethods.yaha_client_config_set_server_certificate_verification_handler(ctx, OnServerCertificateVerificationCallback, GCHandle.ToIntPtr(callbackState));
             }
             if (settings.OnResolveDns is { } onResolveDns)
             {
                 if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Info($"Option '{nameof(settings.OnResolveDns)}' = {onResolveDns}");
 
                 // NOTE: We need to keep the handle to call in the static callback method.
-                //       The handle must be released in Dispose if it is allocated.
-                _onResolveDnsHandle = GCHandle.Alloc(onResolveDns);
+                //       Ownership is handed to the context handle, which frees it only once the
+                //       native context is gone - see YahaContextSafeHandle.AddCallbackState.
+                var callbackState = GCHandle.Alloc(onResolveDns);
+                _handle.AddCallbackState(callbackState);
 
-                NativeMethods.yaha_client_config_set_dns_resolver(ctx, OnResolveDnsCallback, GCHandle.ToIntPtr(_onResolveDnsHandle.Value));
+                NativeMethods.yaha_client_config_set_dns_resolver(ctx, OnResolveDnsCallback, GCHandle.ToIntPtr(callbackState));
             }
             {
                 if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Info($"Option '{nameof(settings.DnsCacheFallbackDuration)}' = {settings.DnsCacheFallbackDuration}");
@@ -709,8 +711,9 @@ namespace Cysharp.Net.Http
 
             if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Info($"Dispose {nameof(NativeHttpHandlerCore)}; disposing={disposing}");
 
-            _onVerifyServerCertificateHandle?.Free();
-            _onResolveDnsHandle?.Free();
+            // NOTE: Callback-state GCHandles are deliberately NOT freed here. They are owned by
+            //       `_handle` and freed when the native context is actually released, because the
+            //       native side may still invoke a callback while requests are in flight.
 
             NativeRuntime.Instance.Release(); // We always need to release runtime.
 
