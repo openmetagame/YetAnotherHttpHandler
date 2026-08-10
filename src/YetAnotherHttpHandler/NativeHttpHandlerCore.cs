@@ -50,10 +50,22 @@ namespace Cysharp.Net.Http
                 _handle.DangerousAddRef(ref addRefContextHandle);
                 Initialize(_handle.DangerousGet(), settings);
             }
-            catch
+            catch (Exception e)
             {
                 // NOTE: If the initialization fails, we need to release the runtime.
                 NativeRuntime.Instance.Release();
+
+                if (e is EntryPointNotFoundException)
+                {
+                    // The managed assembly and the native library are out of step: the managed side
+                    // is calling an export the loaded binary does not have. Say so plainly - the
+                    // raw exception surfaces as an opaque request failure, and on Unity the only
+                    // symptom is that initialization stops part-way through with no error at all.
+                    throw new InvalidOperationException(
+                        $"The native library 'Cysharp.Net.Http.YetAnotherHttpHandler.Native' is missing an entry point required by this version of YetAnotherHttpHandler ({e.Message}). " +
+                        "The pre-built native library is older than the managed assembly. Rebuild the native libraries (see the 'Build Native Libraries' workflow) and update the pre-built binaries under 'Plugins/Cysharp.Net.Http.YetAnotherHttpHandler.Native'.", e);
+                }
+
                 throw;
             }
             finally
