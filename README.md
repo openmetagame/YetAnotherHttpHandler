@@ -342,34 +342,35 @@ Notes:
 
 #### Android: resolving on the active network
 
-This is the main reason resolution lives on the managed side by default. `getaddrinfo` resolves against whichever network the *process* is bound to. If an Android app is backgrounded and that network goes away, every later lookup fails with `EAI_NODATA` ("No address associated with hostname") until the process re-binds — so the app comes back to the foreground and every request fails. Android's own [`bindProcessToNetwork` documentation](https://developer.android.com/reference/android/net/ConnectivityManager#bindProcessToNetwork(android.net.Network)) states this outright, and recommends resolving through the current `Network` object instead:
+**This is automatic — no configuration needed.** On Android, `SystemDnsResolver.Resolve` resolves through the currently active `Network` before falling back to `System.Net.Dns`.
+
+`getaddrinfo` — which both `System.Net.Dns` and hyper's own resolver reach — resolves against whichever network the *process* is bound to. If an Android app is backgrounded and that network goes away, every later lookup fails with `EAI_NODATA` ("No address associated with hostname") until the process re-binds, so the app returns to the foreground and every request fails. Android's own [`bindProcessToNetwork` documentation](https://developer.android.com/reference/android/net/ConnectivityManager#bindProcessToNetwork(android.net.Network)) states this outright and recommends per-network resolution instead.
+
+The implementation is in [`SystemDnsResolver.cs`](src/YetAnotherHttpHandler/SystemDnsResolver.cs), guarded by `#if UNITY_ANDROID && !UNITY_EDITOR`, and does roughly this:
 
 ```csharp
-using var httpHandler = new YetAnotherHttpHandler()
-{
-    OnResolveDns = host =>
-    {
-        // ConnectivityManager.getActiveNetwork().getAllByName(host)
-        using var activity = new AndroidJavaClass("com.unity3d.player.UnityPlayer")
-            .GetStatic<AndroidJavaObject>("currentActivity");
-        using var connectivity = activity.Call<AndroidJavaObject>("getSystemService", "connectivity");
-        using var network = connectivity.Call<AndroidJavaObject>("getActiveNetwork");
-        if (network is null) return null; // no network: report failure and let the cache take over
+// Never cached: a stale Network handle is exactly what this avoids.
+using var activity = new AndroidJavaClass("com.unity3d.player.UnityPlayer")
+    .GetStatic<AndroidJavaObject>("currentActivity");
+using var connectivity = activity.Call<AndroidJavaObject>("getSystemService", "connectivity");
+using var network = connectivity.Call<AndroidJavaObject>("getActiveNetwork");
+if (network == null) return null; // No connectivity: fall through to System.Net.Dns.
 
-        using var resolved = network.Call<AndroidJavaObject>("getAllByName", host);
-        var length = resolved.Call<int>("length"); // InetAddress[]
-        var addresses = new IPAddress[length];
-        for (var i = 0; i < length; i++)
-        {
-            using var inetAddress = resolved.Call<AndroidJavaObject>("get", i);
-            addresses[i] = new IPAddress(inetAddress.Call<byte[]>("getAddress"));
-        }
-        return addresses;
-    },
-};
+var inetAddresses = network.Call<AndroidJavaObject[]>("getAllByName", host); // InetAddress[]
+foreach (var inetAddress in inetAddresses)
+{
+    addresses.Add(new IPAddress(inetAddress.Call<byte[]>("getAddress")));
+    inetAddress.Dispose();
+}
 ```
 
-`getAllByName` requires the `android.permission.INTERNET` permission and must not run on the UI thread — both are satisfied here, since the handler is invoked on a background thread.
+Points worth knowing if you replace or extend it:
+
+- The whole call is bracketed by `AndroidJNI.AttachCurrentThread()` / `DetachCurrentThread()`. The resolver runs on a native runtime thread that Unity never attached, so JNI is illegal without it — and detaching matters just as much, because the runtime retires idle threads and would otherwise leak a JVM thread reference per retired thread.
+- `getActiveNetwork()` requires API 23. Older devices throw and fall through to `System.Net.Dns`.
+- `getAllByName` requires `android.permission.INTERNET` and must not run on the UI thread. It doesn't — the resolver is always called on a background thread.
+- Every failure, including an unknown host, falls through to `System.Net.Dns` and then to the [cache fallback](#falling-back-to-cached-addresses).
+- The Editor is excluded (`!UNITY_EDITOR`), since there is no Android `ConnectivityManager` when playing in the Editor with Android as the target platform.
 
 ### Falling back to cached addresses
 
