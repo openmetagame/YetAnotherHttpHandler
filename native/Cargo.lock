@@ -1186,6 +1186,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "webpki-roots 0.26.11",
  "winres",
 ]

@@ -215,6 +215,8 @@ Once the handler sends a request, these settings become immutable and cannot be 
 |Http2Only|Gets or sets a value that indicates whether to force the use of HTTP/2.|
 |SkipCertificateVerification|Gets or sets a value that indicates whether to skip certificate verification.|
 |OnVerifyServerCertificate|Gets or sets a custom handler that validates server certificates.|
+|OnResolveDns|Gets or sets the name resolver. Defaults to `SystemDnsResolver.Resolve` (managed `System.Net.Dns`); set to `null` to resolve in the native runtime. See [Customizing DNS resolution](#customizing-dns-resolution).|
+|DnsCacheFallbackDuration|Gets or sets how long a previously resolved address stays usable after a name lookup fails. Default is 24 hours; set to `TimeSpan.Zero` to disable.|
 |RootCertificates|Gets or sets a custom root CA. By default, the built-in root CA (Mozilla's root certificates) is used. See also https://github.com/rustls/webpki-roots. |
 |OverrideServerName|Gets or sets a value that specifies subject alternative name (SAN) of the certificate.|
 |ClientAuthCertificates|Gets or sets a custom client auth key.|
@@ -304,6 +306,83 @@ using var httpHandler = new YetAnotherHttpHandler()
     }
 };
 ```
+
+### Customizing DNS resolution
+
+Host names are resolved in managed code by default: `OnResolveDns` starts out set to `SystemDnsResolver.Resolve`, which wraps `System.Net.Dns.GetHostAddresses`. Assign your own handler to replace it:
+
+```csharp
+using var httpHandler = new YetAnotherHttpHandler()
+{
+    OnResolveDns = host => MyResolver.Resolve(host),
+};
+```
+
+Or compose with the default when you only need to special-case some hosts:
+
+```csharp
+    OnResolveDns = host => ResolveSpecialCase(host) ?? SystemDnsResolver.Resolve(host),
+```
+
+Setting the property to `null` hands resolution back to the native runtime (hyper's `GaiResolver`), which is what upstream YetAnotherHttpHandler does:
+
+```csharp
+    OnResolveDns = null,
+```
+
+Both paths ultimately reach the platform resolver, so the default is not by itself a behavioural change. What it buys is a single place to observe, wrap or replace resolution — including on platforms where the correct resolver is only reachable from managed code, as on Android below.
+
+Notes:
+
+- The handler runs on a background thread and is allowed to block, so it can call a synchronous platform API directly.
+- Return `null` or an empty array to report failure; throwing is also treated as failure. Either way the [cache fallback](#falling-back-to-cached-addresses) is consulted before the request fails.
+- At most 32 addresses are used, and the connector tries them in the order given.
+- The host name arrives lower-cased and without a scheme or port, because hyper normalises the authority before resolving.
+- The resolver is not called at all when the URI already contains an IP literal — there is nothing to resolve, so the connector skips it.
+
+#### Android: resolving on the active network
+
+This is the main reason resolution lives on the managed side by default. `getaddrinfo` resolves against whichever network the *process* is bound to. If an Android app is backgrounded and that network goes away, every later lookup fails with `EAI_NODATA` ("No address associated with hostname") until the process re-binds — so the app comes back to the foreground and every request fails. Android's own [`bindProcessToNetwork` documentation](https://developer.android.com/reference/android/net/ConnectivityManager#bindProcessToNetwork(android.net.Network)) states this outright, and recommends resolving through the current `Network` object instead:
+
+```csharp
+using var httpHandler = new YetAnotherHttpHandler()
+{
+    OnResolveDns = host =>
+    {
+        // ConnectivityManager.getActiveNetwork().getAllByName(host)
+        using var activity = new AndroidJavaClass("com.unity3d.player.UnityPlayer")
+            .GetStatic<AndroidJavaObject>("currentActivity");
+        using var connectivity = activity.Call<AndroidJavaObject>("getSystemService", "connectivity");
+        using var network = connectivity.Call<AndroidJavaObject>("getActiveNetwork");
+        if (network is null) return null; // no network: report failure and let the cache take over
+
+        using var resolved = network.Call<AndroidJavaObject>("getAllByName", host);
+        var length = resolved.Call<int>("length"); // InetAddress[]
+        var addresses = new IPAddress[length];
+        for (var i = 0; i < length; i++)
+        {
+            using var inetAddress = resolved.Call<AndroidJavaObject>("get", i);
+            addresses[i] = new IPAddress(inetAddress.Call<byte[]>("getAddress"));
+        }
+        return addresses;
+    },
+};
+```
+
+`getAllByName` requires the `android.permission.INTERNET` permission and must not run on the UI thread — both are satisfied here, since the handler is invoked on a background thread.
+
+### Falling back to cached addresses
+
+Successful lookups are remembered per host, and are used **only** when a later lookup fails. This is controlled by `DnsCacheFallbackDuration`, which defaults to 24 hours:
+
+```csharp
+using var httpHandler = new YetAnotherHttpHandler()
+{
+    DnsCacheFallbackDuration = TimeSpan.FromMinutes(30), // or TimeSpan.Zero to disable
+};
+```
+
+The fallback applies to whichever resolver is in use — the managed default, a custom `OnResolveDns`, or the native one. Because it only ever engages after a lookup has already failed, the trade-off is not "stale address vs. fresh address" but "stale address vs. a failed request" — an address that has genuinely gone away simply fails to connect, leaving the caller no worse off. Shorten or disable it if your services rely on DNS-based failover and you would rather fail fast than reach a decommissioned address.
 
 ### Using Unix Domain Sockets as HTTP transport layer
 

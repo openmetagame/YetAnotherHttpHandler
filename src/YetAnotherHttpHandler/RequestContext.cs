@@ -318,6 +318,20 @@ namespace Cysharp.Net.Http
             Debug.Assert(!_handle.IsAllocated);
             UnsafeUtilities.RequireRunningOnManagedThread();
 
+            // Releasing the native handles calls yaha_request_destroy, which drops the native
+            // request context. Doing that from a tokio thread frees state the runtime is still
+            // using. The debug fail-fast above catches this in development; in release we hand the
+            // work to the .NET thread pool instead of corrupting memory.
+            //
+            // No path should reach here on a runtime thread today - OnComplete deliberately queues
+            // Dispose to the thread pool - so this is a safety net, not a hot path.
+            if (UnsafeUtilities.IsRunningOnNativeRuntimeThread())
+            {
+                if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Error($"[ReqSeq:{_requestSequence}] Attempted to release native handles from a native runtime thread; deferring to the thread pool.");
+                ThreadPool.UnsafeQueueUserWorkItem(static r => ((RequestContext)r!).TryReleaseNativeHandles(), this);
+                return;
+            }
+
             lock (_handleLock)
             {
                 if (_handleReleased)

@@ -16,7 +16,13 @@ namespace Cysharp.Net.Http
         /// This must stay in sync with <c>WORKER_THREAD_NAME</c> in
         /// <c>native/yaha_native/src/context.rs</c>. It is pinned on the Rust side rather than taken
         /// from tokio's default, because tokio renamed that default (1.38 "tokio-runtime-worker" ->
-        /// "tokio-rt-worker") and silently broke every check below.
+        /// "tokio-rt-worker").
+        /// <para>
+        /// This is only used by tests that count runtime threads. Do NOT use it to decide whether
+        /// the current thread belongs to the native runtime - call
+        /// <see cref="IsRunningOnNativeRuntimeThread"/> instead, which asks tokio directly and works
+        /// on every platform.
+        /// </para>
         /// </remarks>
         public const string WorkerThreadName = "yaha-rt-worker";
 
@@ -71,70 +77,48 @@ namespace Cysharp.Net.Http
             static bool IsAsciiCodePoint(uint value) => value <= 0x7Fu;
         }
 
+        /// <summary>
+        /// Returns <see langword="true"/> when the calling thread belongs to the native tokio
+        /// runtime (a worker thread or a blocking-pool thread).
+        /// </summary>
+        /// <remarks>
+        /// Releasing native handles from a runtime thread can free the native request context while
+        /// the runtime is still using it, which corrupts memory rather than failing cleanly.
+        /// <para>
+        /// This used to be inferred from the OS thread name via <c>GetThreadDescription</c>, which
+        /// only exists on Windows - so on Linux, macOS, iOS and Android the check silently did
+        /// nothing, and Android is precisely where the mistake is most expensive. Asking tokio
+        /// directly (<c>Handle::try_current()</c>) works everywhere and also catches blocking-pool
+        /// threads, which carry a different name.
+        /// </para>
+        /// <para>
+        /// This method is always compiled, unlike <see cref="RequireRunningOnManagedThread"/>.
+        /// </para>
+        /// </remarks>
+        public static bool IsRunningOnNativeRuntimeThread()
+        {
+            try
+            {
+                return NativeMethods.yaha_is_runtime_thread();
+            }
+            catch (Exception)
+            {
+                // The native library may not be loaded yet, or may already be unloaded during
+                // shutdown. Neither is a runtime thread.
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Fail-fasts if the calling thread belongs to the native runtime. Debug builds only; see
+        /// <see cref="IsRunningOnNativeRuntimeThread"/> for the always-on check.
+        /// </summary>
         [Conditional("DEBUG")]
         public static void RequireRunningOnManagedThread()
         {
-            // NOTE: This check logic is working only on Windows.
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            if (IsRunningOnNativeRuntimeThread())
             {
-                return;
-            }
-
-            var threadName = GetCurrentThreadName();
-            if (threadName == WorkerThreadName)
-            {
-                Environment.FailFast($"The current thread is the tokio worker thread.");
-            }
-
-            static string GetCurrentThreadName()
-            {
-                const uint THREAD_QUERY_LIMITED_INFORMATION = 0x0800;
-
-                var threadId = GetCurrentThreadId();
-                var threadName = string.Empty;
-                var threadHandle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, threadId);
-
-                if (threadHandle != IntPtr.Zero)
-                {
-                    try
-                    {
-                        IntPtr threadDescriptionPtr;
-                        var result = GetThreadDescription(threadHandle, out threadDescriptionPtr);
-
-                        if (result >= 0 && threadDescriptionPtr != IntPtr.Zero)
-                        {
-                            try
-                            {
-                                threadName = Marshal.PtrToStringUni(threadDescriptionPtr);
-                            }
-                            finally
-                            {
-                                LocalFree(threadDescriptionPtr);
-                            }
-                        }
-                    }
-                    finally
-                    {
-                        CloseHandle(threadHandle);
-                    }
-                }
-
-                return threadName ?? string.Empty;
-
-                [DllImport("kernel32.dll", SetLastError = true)]
-                static extern bool CloseHandle(IntPtr hObject);
-
-                [DllImport("kernel32.dll", SetLastError = true)]
-                static extern uint GetCurrentThreadId();
-
-                [DllImport("kernel32.dll", SetLastError = true)]
-                static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
-
-                [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-                static extern int GetThreadDescription(IntPtr hThread, out IntPtr ppszThreadDescription);
-
-                [DllImport("kernel32.dll")]
-                static extern IntPtr LocalFree(IntPtr hMem);
+                Environment.FailFast($"The current thread is a native runtime (tokio) thread.");
             }
         }
     }

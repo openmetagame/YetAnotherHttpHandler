@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Net;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -49,6 +50,54 @@ namespace Cysharp.Net.Http
         /// Gets or sets a custom handler that validates server certificates.
         /// </summary>
         public ServerCertificateVerificationHandler? OnVerifyServerCertificate { get => _settings.OnVerifyServerCertificate; set => _settings.OnVerifyServerCertificate = value; }
+
+        /// <summary>
+        /// Gets or sets the name resolver. Defaults to <see cref="SystemDnsResolver.Resolve"/>, so
+        /// host names are resolved in managed code; set to <see langword="null"/> to resolve in the
+        /// native runtime instead.
+        /// </summary>
+        /// <remarks>
+        /// The handler is invoked on a background thread and may block, so it is free to call a
+        /// synchronous platform API.
+        /// <para>
+        /// The reason resolution defaults to managed code is Android. <c>getaddrinfo</c> resolves
+        /// against whichever network the <em>process</em> is bound to; if the app is backgrounded and
+        /// that network goes away, every later lookup fails with <c>EAI_NODATA</c> ("No address
+        /// associated with hostname") until the process re-binds. Resolving through the currently
+        /// active <c>Network</c> object instead - <c>ConnectivityManager.getActiveNetwork()</c>
+        /// followed by <c>Network.getAllByName(host)</c> - is the platform-recommended way to avoid
+        /// that, and it is only reachable from managed/Java code. Having the resolver here by default
+        /// means overriding it is a property assignment rather than a native rebuild.
+        /// </para>
+        /// <para>
+        /// Return <see langword="null"/> or an empty array to report failure; throwing is also
+        /// treated as failure. Either way the resolver falls back to
+        /// <see cref="DnsCacheFallbackDuration"/> before giving up.
+        /// </para>
+        /// <para>
+        /// Not called when the request URI already contains an IP literal - there is nothing to
+        /// resolve, so the connector skips it.
+        /// </para>
+        /// </remarks>
+        public DnsResolutionHandler? OnResolveDns { get => _settings.OnResolveDns; set => _settings.OnResolveDns = value; }
+
+        /// <summary>
+        /// Gets or sets how long a previously resolved address stays usable after a name lookup
+        /// fails. Defaults to 24 hours; set to <see cref="TimeSpan.Zero"/> to disable.
+        /// </summary>
+        /// <remarks>
+        /// Successful lookups are recorded per host. The recorded addresses are consulted
+        /// <em>only</em> when a lookup fails, so the choice is never "stale address vs. fresh
+        /// address" - it is "stale address vs. a failed request". A stale address that has genuinely
+        /// gone away simply fails to connect, leaving the caller no worse off.
+        /// <para>
+        /// The default is deliberately generous because the case this exists for - an Android app
+        /// resuming from the background onto a dead network binding - can follow an arbitrarily long
+        /// pause. Shorten it if your services rely on DNS-based failover and you would rather fail
+        /// fast than reach a decommissioned address.
+        /// </para>
+        /// </remarks>
+        public TimeSpan DnsCacheFallbackDuration { get => _settings.DnsCacheFallbackDuration; set => _settings.DnsCacheFallbackDuration = value; }
 
         /// <summary>
         /// Gets or sets a custom root CA. By default, the built-in root CA (Mozilla's root certificates) is used. See also <seealso href="https://github.com/rustls/webpki-roots" />.
@@ -246,6 +295,20 @@ namespace Cysharp.Net.Http
     /// <returns></returns>
     public delegate bool ServerCertificateVerificationHandler(string serverName, ReadOnlySpan<byte> certificate, DateTimeOffset now);
 
+    /// <summary>
+    /// Resolves a host name to a set of IP addresses, replacing the platform resolver.
+    /// </summary>
+    /// <param name="host">The host name to resolve. Never null or empty.</param>
+    /// <returns>
+    /// The resolved addresses, or <see langword="null"/>/empty to report failure. At most 32
+    /// addresses are used; any beyond that are ignored.
+    /// </returns>
+    /// <remarks>
+    /// Called on a background thread and allowed to block. See
+    /// <see cref="YetAnotherHttpHandler.OnResolveDns"/>.
+    /// </remarks>
+    public delegate IPAddress[]? DnsResolutionHandler(string host);
+
     internal class NativeClientSettings
     {
         public TimeSpan? PoolIdleTimeout { get; set; }
@@ -253,6 +316,9 @@ namespace Cysharp.Net.Http
         public bool? Http2Only { get; set; }
         public bool? SkipCertificateVerification { get; set; }
         public ServerCertificateVerificationHandler? OnVerifyServerCertificate { get; set; }
+        // Resolution runs in managed code by default; see YetAnotherHttpHandler.OnResolveDns.
+        public DnsResolutionHandler? OnResolveDns { get; set; } = SystemDnsResolver.Resolve;
+        public TimeSpan DnsCacheFallbackDuration { get; set; } = TimeSpan.FromHours(24);
         public string? RootCertificates { get; set; }
         public string? OverrideServerName { get; set; }
         public string? ClientAuthCertificates { get; set; }
@@ -281,6 +347,8 @@ namespace Cysharp.Net.Http
                 Http2Only = this.Http2Only,
                 SkipCertificateVerification = this.SkipCertificateVerification,
                 OnVerifyServerCertificate = this.OnVerifyServerCertificate,
+                OnResolveDns = this.OnResolveDns,
+                DnsCacheFallbackDuration = this.DnsCacheFallbackDuration,
                 RootCertificates = this.RootCertificates,
                 OverrideServerName = this.OverrideServerName,
                 ClientAuthCertificates = this.ClientAuthCertificates,

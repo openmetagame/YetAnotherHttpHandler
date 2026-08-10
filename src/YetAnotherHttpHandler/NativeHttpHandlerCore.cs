@@ -1,5 +1,7 @@
 using System;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.IO.Pipelines;
 using System.Net.Http;
@@ -22,6 +24,7 @@ namespace Cysharp.Net.Http
         //private unsafe YahaNativeContext* _ctx;
         private readonly YahaContextSafeHandle _handle;
         private GCHandle? _onVerifyServerCertificateHandle; // The handle must be released in Dispose if it is allocated.
+        private GCHandle? _onResolveDnsHandle; // The handle must be released in Dispose if it is allocated.
         private bool _disposed = false;
         private PipeOptions? _responsePipeOptions;
 
@@ -31,6 +34,7 @@ namespace Cysharp.Net.Http
         private static readonly unsafe NativeMethods.yaha_init_context_on_receive_delegate OnReceiveCallback = OnReceive;
         private static readonly unsafe NativeMethods.yaha_init_context_on_complete_delegate OnCompleteCallback = OnComplete;
         private static readonly unsafe NativeMethods.yaha_client_config_set_server_certificate_verification_handler_handler_delegate OnServerCertificateVerificationCallback = OnServerCertificateVerification;
+        private static readonly unsafe NativeMethods.yaha_client_config_set_dns_resolver_handler_delegate OnResolveDnsCallback = OnResolveDns;
 
         public unsafe NativeHttpHandlerCore(NativeClientSettings settings)
         {
@@ -89,6 +93,20 @@ namespace Cysharp.Net.Http
                 _onVerifyServerCertificateHandle = GCHandle.Alloc(onVerifyServerCertificate);
 
                 NativeMethods.yaha_client_config_set_server_certificate_verification_handler(ctx, OnServerCertificateVerificationCallback, GCHandle.ToIntPtr(_onVerifyServerCertificateHandle.Value));
+            }
+            if (settings.OnResolveDns is { } onResolveDns)
+            {
+                if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Info($"Option '{nameof(settings.OnResolveDns)}' = {onResolveDns}");
+
+                // NOTE: We need to keep the handle to call in the static callback method.
+                //       The handle must be released in Dispose if it is allocated.
+                _onResolveDnsHandle = GCHandle.Alloc(onResolveDns);
+
+                NativeMethods.yaha_client_config_set_dns_resolver(ctx, OnResolveDnsCallback, GCHandle.ToIntPtr(_onResolveDnsHandle.Value));
+            }
+            {
+                if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Info($"Option '{nameof(settings.DnsCacheFallbackDuration)}' = {settings.DnsCacheFallbackDuration}");
+                NativeMethods.yaha_client_config_dns_cache_fallback_duration(ctx, (ulong)settings.DnsCacheFallbackDuration.TotalMilliseconds);
             }
             if (settings.RootCertificates is { } rootCertificates)
             {
@@ -467,6 +485,53 @@ namespace Cysharp.Net.Http
             }
         }
 
+        [MonoPInvokeCallback(typeof(NativeMethods.yaha_client_config_set_dns_resolver_handler_delegate))]
+        private static unsafe int OnResolveDns(IntPtr callbackState, byte* hostPtr, UIntPtr /*nuint*/ hostLength, YahaSocketAddress* addresses, int addressesCapacity)
+        {
+            // Runs on a native blocking thread, so the handler is allowed to take its time.
+            // Everything here must be exception-safe: an exception escaping into Rust would cross an
+            // `extern "C"` boundary and abort the process.
+            try
+            {
+                var host = UnsafeUtilities.GetStringFromUtf8Bytes(new ReadOnlySpan<byte>(hostPtr, (int)hostLength));
+                if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Trace($"OnResolveDns: State=0x{callbackState:X}; Host={host}");
+
+                var onResolveDns = (DnsResolutionHandler?)GCHandle.FromIntPtr(callbackState).Target;
+                Debug.Assert(onResolveDns != null);
+                if (onResolveDns == null)
+                {
+                    if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Warning($"OnResolveDns: The resolver callback was called, but onResolveDns is null.");
+                    return -1;
+                }
+
+                var resolved = onResolveDns(host);
+                if (resolved is null || resolved.Length == 0)
+                {
+                    if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Trace($"OnResolveDns: The resolver returned no addresses for '{host}'.");
+                    return -1;
+                }
+
+                // The buffer belongs to the native caller; we only fill in the entries we use and
+                // report how many, so unwritten slots are never read.
+                var written = 0;
+                for (var i = 0; i < resolved.Length && written < addressesCapacity; i++)
+                {
+                    if (addresses[written].TrySetAddress(resolved[i]))
+                    {
+                        written++;
+                    }
+                }
+
+                if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Trace($"OnResolveDns: Resolved '{host}' to {written} address(es).");
+                return written == 0 ? -1 : written;
+            }
+            catch (Exception e)
+            {
+                if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Error($"OnResolveDns: The resolver callback thrown an exception: {e}");
+                return -1;
+            }
+        }
+
         [MonoPInvokeCallback(typeof(NativeMethods.yaha_init_context_on_receive_delegate))]
         private static unsafe void OnReceive(int reqSeq, IntPtr state, UIntPtr length, byte* buf, nuint taskHandle)
         {
@@ -645,6 +710,7 @@ namespace Cysharp.Net.Http
             if (YahaEventSource.Log.IsEnabled()) YahaEventSource.Log.Info($"Dispose {nameof(NativeHttpHandlerCore)}; disposing={disposing}");
 
             _onVerifyServerCertificateHandle?.Free();
+            _onResolveDnsHandle?.Free();
 
             NativeRuntime.Instance.Release(); // We always need to release runtime.
 

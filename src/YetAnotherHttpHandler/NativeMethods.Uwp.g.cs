@@ -21,6 +21,9 @@ namespace Cysharp.Net.Http
         internal delegate bool yaha_client_config_set_server_certificate_verification_handler_handler_delegate(nint state, byte* server_name, nuint server_name_len, byte* certificate_der, nuint certificate_der_len, ulong now);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate int yaha_client_config_set_dns_resolver_handler_delegate(nint callback_state, byte* host, nuint host_len, YahaSocketAddress* addresses, int addresses_capacity);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void yaha_init_context_on_complete_delegate(int req_seq, nint state, CompletionReason reason, uint h2_error_code);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -49,6 +52,20 @@ namespace Cysharp.Net.Http
         [DllImport(__DllName, EntryPoint = "yaha_dispose_context", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern void yaha_dispose_context(YahaNativeContext* ctx);
 
+        /// <summary>
+        ///  Whether the calling thread belongs to the native tokio runtime (a worker or blocking thread).
+        ///
+        ///  The managed side must never release native handles from a runtime thread. It used to detect
+        ///  that by comparing the OS thread name, which only ever worked on Windows and was therefore inert
+        ///  on Android/IL2CPP - the platform where the mistake is most costly. Asking tokio directly works
+        ///  everywhere and also catches blocking-pool threads, which are named differently.
+        ///
+        ///  See `UnsafeUtilities.IsRunningOnNativeRuntimeThread`.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "yaha_is_runtime_thread", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        [return: MarshalAs(UnmanagedType.U1)]
+        internal static extern bool yaha_is_runtime_thread();
+
         [DllImport(__DllName, EntryPoint = "yaha_client_config_add_root_certificates", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern nuint yaha_client_config_add_root_certificates(YahaNativeContext* ctx, StringBuffer* root_certs);
 
@@ -66,6 +83,28 @@ namespace Cysharp.Net.Http
 
         [DllImport(__DllName, EntryPoint = "yaha_client_config_set_server_certificate_verification_handler", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern void yaha_client_config_set_server_certificate_verification_handler(YahaNativeContext* ctx, yaha_client_config_set_server_certificate_verification_handler_handler_delegate handler, nint callback_state);
+
+        /// <summary>
+        ///  Installs an external name resolver, replacing the platform one (`getaddrinfo`).
+        ///
+        ///  Pass `None` to go back to the platform resolver. The handler runs on a blocking thread, so it is
+        ///  free to make a synchronous platform call - on Android that means resolving against the currently
+        ///  active `Network`, which is the only way to avoid a stale process-wide network binding making
+        ///  every lookup fail after the app returns from the background.
+        ///
+        ///  Must be called before `yaha_build_client`.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "yaha_client_config_set_dns_resolver", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern void yaha_client_config_set_dns_resolver(YahaNativeContext* ctx, yaha_client_config_set_dns_resolver_handler_delegate handler, nint callback_state);
+
+        /// <summary>
+        ///  How long a previously resolved address stays usable after a lookup fails. `0` disables the
+        ///  fallback entirely.
+        ///
+        ///  Must be called before `yaha_build_client`.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "yaha_client_config_dns_cache_fallback_duration", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern void yaha_client_config_dns_cache_fallback_duration(YahaNativeContext* ctx, ulong duration_milliseconds);
 
         [DllImport(__DllName, EntryPoint = "yaha_client_config_pool_idle_timeout", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern void yaha_client_config_pool_idle_timeout(YahaNativeContext* ctx, ulong val_milliseconds);
@@ -211,6 +250,28 @@ namespace Cysharp.Net.Http
     [StructLayout(LayoutKind.Sequential)]
     internal unsafe partial struct YahaNativeRequestContext
     {
+    }
+
+    /// <summary>
+    ///  One resolved address. The managed resolver writes these into a buffer owned by the caller, so
+    ///  neither side has to allocate or agree on who frees what.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe partial struct YahaSocketAddress
+    {
+        /// <summary>
+        ///  [`YAHA_ADDRESS_FAMILY_IPV4`] or [`YAHA_ADDRESS_FAMILY_IPV6`]. Entries with any other value
+        ///  are skipped, so a managed resolver can leave unused slots zeroed.
+        /// </summary>
+        public int family;
+        /// <summary>
+        ///  IPv6 scope id (interface index). Ignored for IPv4.
+        /// </summary>
+        public uint scope_id;
+        /// <summary>
+        ///  Network byte order, matching `IPAddress.GetAddressBytes()`. IPv4 uses the first 4 bytes.
+        /// </summary>
+        public fixed byte address[16];
     }
 
 

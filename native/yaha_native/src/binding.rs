@@ -13,10 +13,11 @@ use tokio::{select, sync::oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::interop::{ByteBuffer, StringBuffer};
+use crate::resolver::YahaSocketAddress;
 use crate::primitives::{CompletionReason, YahaHttpVersion};
 use crate::{
     context::{
-        YahaNativeContext, YahaNativeContextInternal, YahaNativeRequestContext,
+        OnComplete, YahaNativeContext, YahaNativeContextInternal, YahaNativeRequestContext,
         YahaNativeRequestContextInternal, YahaNativeRuntimeContext,
         YahaNativeRuntimeContextInternal,
     },
@@ -83,14 +84,29 @@ pub extern "C" fn yaha_init_context(
 
 #[no_mangle]
 pub extern "C" fn yaha_dispose_context(ctx: *mut YahaNativeContext) {
-    let mut ctx = unsafe { Box::from_raw(ctx as *mut YahaNativeContextInternal) };
-    ctx.on_complete = _sentinel_on_complete;
-    ctx.on_receive = _sentinel_on_receive;
-    ctx.on_status_code_and_headers_receive = _sentinel_on_status_code_and_headers_receive;
+    // Reclaims the context allocation. This is safe to call with requests still in flight: each
+    // request task owns a `RequestClient` snapshot (see `context.rs`) instead of borrowing the
+    // context, so nothing reads this memory once it is freed.
+    //
+    // This used to overwrite the three callbacks with panicking sentinels first. That was dead
+    // code - the `Box` is dropped on return, so the sentinels were written into memory that is
+    // freed microseconds later - and it disguised the real hazard, which was that in-flight tasks
+    // held a `&'static mut` into this very allocation.
+    drop(unsafe { Box::from_raw(ctx as *mut YahaNativeContextInternal) });
 }
-extern "C" fn _sentinel_on_complete(_: i32, _: NonZeroIsize, _: CompletionReason, _: u32) { panic!("The context has already disposed: on_complete"); }
-extern "C" fn _sentinel_on_receive(_: i32, _: NonZeroIsize, _: usize, _: *const u8, _: usize) { panic!("The context has already disposed: on_receive"); }
-extern "C" fn _sentinel_on_status_code_and_headers_receive(_: i32, _: NonZeroIsize, _: i32, _: YahaHttpVersion) { panic!("The context has already disposed: on_status_code_and_headers_receive"); }
+
+/// Whether the calling thread belongs to the native tokio runtime (a worker or blocking thread).
+///
+/// The managed side must never release native handles from a runtime thread. It used to detect
+/// that by comparing the OS thread name, which only ever worked on Windows and was therefore inert
+/// on Android/IL2CPP - the platform where the mistake is most costly. Asking tokio directly works
+/// everywhere and also catches blocking-pool threads, which are named differently.
+///
+/// See `UnsafeUtilities.IsRunningOnNativeRuntimeThread`.
+#[no_mangle]
+pub extern "C" fn yaha_is_runtime_thread() -> bool {
+    tokio::runtime::Handle::try_current().is_ok()
+}
 
 #[no_mangle]
 pub extern "C" fn yaha_client_config_add_root_certificates(
@@ -183,6 +199,51 @@ pub extern "C" fn yaha_client_config_set_server_certificate_verification_handler
 ) {
     let ctx = YahaNativeContextInternal::from_raw_context(ctx);
     ctx.server_certificate_verification_handler = handler.map(|x| (x, callback_state));
+}
+
+/// Installs an external name resolver, replacing the platform one (`getaddrinfo`).
+///
+/// Pass `None` to go back to the platform resolver. The handler runs on a blocking thread, so it is
+/// free to make a synchronous platform call - on Android that means resolving against the currently
+/// active `Network`, which is the only way to avoid a stale process-wide network binding making
+/// every lookup fail after the app returns from the background.
+///
+/// Must be called before `yaha_build_client`.
+#[no_mangle]
+pub extern "C" fn yaha_client_config_set_dns_resolver(
+    ctx: *mut YahaNativeContext,
+    // NOTE: spelled out rather than using the `OnResolveDns` alias so that csbindgen emits a
+    // delegate type and the `YahaSocketAddress` struct for the managed side.
+    handler: Option<
+        extern "C" fn(
+            callback_state: NonZeroIsize,
+            host: *const u8,
+            host_len: usize,
+            addresses: *mut YahaSocketAddress,
+            addresses_capacity: i32,
+        ) -> i32,
+    >,
+    callback_state: NonZeroIsize,
+) {
+    let ctx = YahaNativeContextInternal::from_raw_context(ctx);
+    ctx.dns_resolver_handler = handler.map(|handler| (handler, callback_state));
+}
+
+/// How long a previously resolved address stays usable after a lookup fails. `0` disables the
+/// fallback entirely.
+///
+/// Must be called before `yaha_build_client`.
+#[no_mangle]
+pub extern "C" fn yaha_client_config_dns_cache_fallback_duration(
+    ctx: *mut YahaNativeContext,
+    duration_milliseconds: u64,
+) {
+    let ctx = YahaNativeContextInternal::from_raw_context(ctx);
+    ctx.dns_cache_fallback_duration = if duration_milliseconds == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(duration_milliseconds))
+    };
 }
 
 #[no_mangle]
@@ -481,6 +542,84 @@ pub unsafe extern "C" fn yaha_request_set_header(
     true
 }
 
+/// Guarantees that exactly one `on_complete` is delivered for every request.
+///
+/// The managed `~RequestContext` blocks on `_fullyCompleted.Wait()`, and only `on_complete` ever
+/// releases it. So a request that ends without calling back wedges the CLR finalizer thread for
+/// the lifetime of the process - which stops *all* finalization, not just this handler's.
+///
+/// Every terminal path calls [`CompletionGuard::complete`]. If the task instead unwinds (a panic
+/// anywhere in the request pipeline) or is dropped without completing (the tokio runtime being shut
+/// down under an in-flight request), `Drop` delivers `on_complete(Error)` on the way out. The
+/// `completed` flag makes the call idempotent, so the "exactly once" half of the contract holds
+/// even if a terminal path and the drop both run.
+struct CompletionGuard {
+    on_complete: OnComplete,
+    seq: i32,
+    state: NonZeroIsize,
+    req_ctx: Arc<Mutex<YahaNativeRequestContextInternal>>,
+    completed: bool,
+}
+
+impl CompletionGuard {
+    fn new(
+        on_complete: OnComplete,
+        seq: i32,
+        state: NonZeroIsize,
+        req_ctx: Arc<Mutex<YahaNativeRequestContextInternal>>,
+    ) -> Self {
+        CompletionGuard { on_complete, seq, state, req_ctx, completed: false }
+    }
+
+    /// Records an error message for `yaha_get_last_error` to hand back to the managed side.
+    ///
+    /// `NativeHttpHandlerCore.OnComplete` dereferences that buffer unconditionally when the reason
+    /// is `Error`, so every error completion must leave one behind.
+    fn set_last_error(&self, message: String) {
+        if let Ok(mut req_ctx) = self.req_ctx.lock() {
+            req_ctx.last_error = Some(message);
+        }
+    }
+
+    fn complete(&mut self, reason: CompletionReason, h2_error_code: u32) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        (self.on_complete)(self.seq, self.state, reason, h2_error_code);
+    }
+
+    fn complete_with_message(&mut self, reason: CompletionReason, message: &str) {
+        self.set_last_error(message.to_string());
+        self.complete(reason, 0);
+    }
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+
+        // The task is going away without having completed: either it panicked, or the runtime was
+        // shut down and dropped it. Report an error rather than leaving the managed side waiting
+        // forever. `last_error` may already be set by whoever tore us down; only fill in a generic
+        // message if it is not, since it must never be `None` for an error completion.
+        if let Ok(mut req_ctx) = self.req_ctx.lock() {
+            if req_ctx.last_error.is_none() {
+                req_ctx.last_error = Some(
+                    "The request was terminated before it completed. The native request task was \
+                     dropped or panicked."
+                        .to_string(),
+                );
+            }
+        }
+
+        self.completed = true;
+        (self.on_complete)(self.seq, self.state, CompletionReason::Error, 0);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn yaha_request_begin(
     ctx: *mut YahaNativeContext,
@@ -489,13 +628,21 @@ pub extern "C" fn yaha_request_begin(
 ) -> bool {
     let ctx = YahaNativeContextInternal::from_raw_context(ctx);
 
+    // Take everything the task needs from the context *by value*, before spawning. The task must
+    // not borrow the context: `yaha_dispose_context` frees it, and the managed side is free to call
+    // that while this request is still running.
+    let client = ctx.request_client();
+    let runtime = ctx.runtime.clone();
+
     // Begin request on async runtime.
     let body;
+    let seq;
 
     let req_ctx = crate::context::to_internal_arc(req_ctx); // NOTE: we must call `Arc::into_raw` at last of the method.
 
     {
         let mut req_ctx = req_ctx.lock().unwrap();
+        seq = req_ctx.seq;
 
         if req_ctx.has_body {
             let (tx, rx) = futures_channel::mpsc::channel::<Bytes>(0);
@@ -520,53 +667,71 @@ pub extern "C" fn yaha_request_begin(
     }
     {
         let req_ctx = req_ctx.clone();
-        ctx.runtime.clone().spawn(async move {
+        runtime.spawn(async move {
+            // From here on, every exit path - including a panic or the runtime dropping this task -
+            // delivers exactly one `on_complete`. See `CompletionGuard`.
+            let mut guard = CompletionGuard::new(client.on_complete, seq, state, req_ctx.clone());
+
             let cancellation_token = {
                 let req_ctx = req_ctx.lock().unwrap();
                 req_ctx.cancellation_token.clone()
             };
 
-            // Prepare for begin request
-            let (seq, req) = {
+            // Prepare for begin request.
+            //
+            // `Builder::body` fails if any earlier `yaha_request_set_*` call stored an error (an
+            // unparsable method, for instance). Report that instead of unwrapping: a panic here
+            // used to skip `on_complete` entirely.
+            let req = {
                 let mut req_ctx = req_ctx.lock().unwrap();
-                assert!(req_ctx.builder.is_some());
-
-                let builder = req_ctx.builder.take().unwrap();
-                (req_ctx.seq, builder.body(body).unwrap())
+                let Some(builder) = req_ctx.builder.take() else {
+                    drop(req_ctx);
+                    guard.complete_with_message(
+                        CompletionReason::Error,
+                        "The request has already been started.",
+                    );
+                    return;
+                };
+                match builder.body(body) {
+                    Ok(req) => req,
+                    Err(err) => {
+                        drop(req_ctx);
+                        guard.complete_with_message(
+                            CompletionReason::Error,
+                            &format!("Failed to build the request: {err}"),
+                        );
+                        return;
+                    }
+                }
             };
 
-            #[cfg(unix)]
-            let client_is_none = ctx.tcp_client.is_none() && ctx.uds_client.is_none();
-            #[cfg(not(unix))]
-            let client_is_none = ctx.tcp_client.is_none();
-
-            if client_is_none {
-                {
-                    let mut req_ctx = req_ctx.lock().unwrap();
-                    req_ctx.last_error = Some("The client has not been built. You need to build it before sending the request.".to_string());
-                }
-                (ctx.on_complete)(seq, state, CompletionReason::Error, 0);
+            if !client.has_client() {
+                guard.complete_with_message(
+                    CompletionReason::Error,
+                    "The client has not been built. You need to build it before sending the request.",
+                );
                 return;
             }
 
             // Send a request and wait for response status and headers.
             let res = select! {
                 _ = cancellation_token.cancelled() => {
-                    (ctx.on_complete)(seq, state, CompletionReason::Aborted, 0);
+                    guard.complete(CompletionReason::Aborted, 0);
                     return;
                 }
-                res = ctx.request(req) => {
-                    if let Err(err) = res {
-                        complete_with_error(ctx, req_ctx, seq, state, err);
-                        return;
-                    } else {
-                        res
+                res = client.request(req) => {
+                    match res {
+                        Err(err) => {
+                            complete_with_error(&mut guard, err);
+                            return;
+                        }
+                        Ok(res) => res,
                     }
                 }
             };
 
             // Status code and response headers are received.
-            let mut res = res.unwrap();
+            let mut res = res;
             {
                 let mut req_ctx = req_ctx.lock().unwrap();
                 req_ctx.response_headers = Some(
@@ -583,7 +748,7 @@ pub extern "C" fn yaha_request_begin(
                 req_ctx.response_status = res.status();
                 req_ctx.response_version = YahaHttpVersion::from(res.version());
             }
-            (ctx.on_status_code_and_headers_receive)(
+            (client.on_status_code_and_headers_receive)(
                 seq,
                 state,
                 res.status().as_u16() as i32,
@@ -598,7 +763,7 @@ pub extern "C" fn yaha_request_begin(
             while !body.is_end_stream() {
                 select! {
                     _ = cancellation_token.cancelled() => {
-                        (ctx.on_complete)(seq, state, CompletionReason::Aborted, 0);
+                        guard.complete(CompletionReason::Aborted, 0);
                         return;
                     }
                     received = body.frame() => {
@@ -611,26 +776,45 @@ pub extern "C" fn yaha_request_begin(
                                             let (tx, rx) = oneshot::channel::<Result<(), String>>();
                                             let tx = Box::into_raw(Box::new(tx)) as usize;
 
-                                            (ctx.on_receive)(seq, state, data.len(), data.as_ptr(), tx);
-                                            match rx.await {
+                                            (client.on_receive)(seq, state, data.len(), data.as_ptr(), tx);
+
+                                            // Wait for the managed side to finish consuming the
+                                            // frame - but stay cancellable while we do.
+                                            //
+                                            // This is the one await in the request that used to be
+                                            // outside the cancellation `select!`, which made an
+                                            // aborted request depend entirely on managed code
+                                            // reaching `yaha_complete_task`. If cancellation wins,
+                                            // `rx` is dropped; the managed side still owns the
+                                            // `Sender` and `yaha_complete_task` simply finds the
+                                            // receiver gone and does nothing.
+                                            //
+                                            // Dropping the frame here is safe: `OnReceive` copies
+                                            // the buffer into the response pipe synchronously
+                                            // before returning, and only the flush is deferred.
+                                            let received = select! {
+                                                _ = cancellation_token.cancelled() => {
+                                                    guard.complete(CompletionReason::Aborted, 0);
+                                                    return;
+                                                }
+                                                result = rx => result,
+                                            };
+
+                                            match received {
                                                 Ok(result) => {
                                                     if let Err(err) = result {
                                                         // the sender reports an error
-                                                        {
-                                                            let mut req_ctx = req_ctx.lock().unwrap();
-                                                            req_ctx.last_error = Some(err);
-                                                        }
-                                                        (ctx.on_complete)(seq, state, CompletionReason::Error, 0);
+                                                        guard.set_last_error(err);
+                                                        guard.complete(CompletionReason::Error, 0);
                                                         return;
                                                     }
                                                 },
-                                                Err(e) => {
+                                                Err(_) => {
                                                     // the sender is dropped without sending
-                                                    {
-                                                        let mut req_ctx = req_ctx.lock().unwrap();
-                                                        req_ctx.last_error = Some("on_receive() has not completed correctly.".to_string());
-                                                    }
-                                                    (ctx.on_complete)(seq, state, CompletionReason::Error, 0);
+                                                    guard.complete_with_message(
+                                                        CompletionReason::Error,
+                                                        "on_receive() has not completed correctly.",
+                                                    );
                                                     return;
                                                 }
                                             }
@@ -660,10 +844,7 @@ pub extern "C" fn yaha_request_begin(
                                     }
                                     Err(err) => {
                                         //println!("body.data: on_complete_error");
-                                        {
-                                            let mut req_ctx = req_ctx.lock().unwrap();
-                                            req_ctx.last_error = Some(err.to_string());
-                                        }
+                                        guard.set_last_error(err.to_string());
 
                                         // If the `hyper::Error` has `h2::Error` as inner error, the error has HTTP/2 error code.
                                         let reason = err.source()
@@ -672,7 +853,7 @@ pub extern "C" fn yaha_request_begin(
 
                                         let rc = reason.map(|r| u32::from(r));
 
-                                        (ctx.on_complete)(seq, state, CompletionReason::Error, rc.unwrap_or_default());
+                                        guard.complete(CompletionReason::Error, rc.unwrap_or_default());
                                         return;
                                     }
                                 }
@@ -691,7 +872,7 @@ pub extern "C" fn yaha_request_begin(
                 req_ctx.try_complete();
             }
 
-            (ctx.on_complete)(seq, state, CompletionReason::Success, 0);
+            guard.complete(CompletionReason::Success, 0);
 
             {
                 let mut req_ctx = req_ctx.lock().unwrap();
@@ -704,26 +885,23 @@ pub extern "C" fn yaha_request_begin(
     true
 }
 
-fn complete_with_error(ctx: &mut YahaNativeContextInternal, req_ctx: Arc<Mutex<YahaNativeRequestContextInternal>>, seq: i32, state: NonZeroIsize, err: hyper_util::client::legacy::Error) {
+fn complete_with_error(guard: &mut CompletionGuard, err: hyper_util::client::legacy::Error) {
     let mut h2_error_code = None;
 
-    {
-        let mut req_ctx = req_ctx.lock().unwrap();
-        // If the error has the inner error, use its error message instead.
-        if let Some(error_inner) = err.source() {
-            req_ctx.last_error = Some(format!("{}: {}", err.to_string(), error_inner.to_string()));
+    // If the error has the inner error, use its error message instead.
+    if let Some(error_inner) = err.source() {
+        guard.set_last_error(format!("{}: {}", err.to_string(), error_inner.to_string()));
 
-            // If the Error has `h2::Error` as inner error, the error has HTTP/2 error code.
-            h2_error_code = error_inner.source()
-                .and_then(|e| e.downcast_ref::<h2::Error>())
-                .and_then(|e| e.reason())
-                .map(|e| u32::from(e));
-        } else {
-            req_ctx.last_error = Some(err.to_string());
-        }
+        // If the Error has `h2::Error` as inner error, the error has HTTP/2 error code.
+        h2_error_code = error_inner.source()
+            .and_then(|e| e.downcast_ref::<h2::Error>())
+            .and_then(|e| e.reason())
+            .map(|e| u32::from(e));
+    } else {
+        guard.set_last_error(err.to_string());
     }
 
-    (ctx.on_complete)(seq, state, CompletionReason::Error, h2_error_code.unwrap_or_default());
+    guard.complete(CompletionReason::Error, h2_error_code.unwrap_or_default());
 }
 
 #[no_mangle]
@@ -869,11 +1047,20 @@ pub extern "C" fn yaha_request_destroy(
 
 #[no_mangle]
 pub extern "C" fn yaha_complete_task(task_handle: usize, error: *const StringBuffer) {
-    let tx = unsafe { Box::from_raw(task_handle as *mut oneshot::Sender<Result<(), String>>) };
-    if error.is_null() {
-        tx.send(Ok(())).unwrap();
-    } else {
-        let error = unsafe { (*error).to_str().to_string() };
-        tx.send(Err(error)).unwrap();
+    if task_handle == 0 {
+        return;
     }
+
+    let tx = unsafe { Box::from_raw(task_handle as *mut oneshot::Sender<Result<(), String>>) };
+    let result = if error.is_null() {
+        Ok(())
+    } else {
+        Err(unsafe { (*error).to_str().to_string() })
+    };
+
+    // Ignore the send result. `send` fails only when the receiver is already gone, which is a
+    // normal outcome: the request may have been cancelled while the managed side was still
+    // consuming the frame, or the runtime may have dropped the task. This used to be `.unwrap()`,
+    // and a panic out of an `extern "C"` function aborts the whole process.
+    let _ = tx.send(result);
 }

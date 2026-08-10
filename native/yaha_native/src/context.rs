@@ -29,12 +29,28 @@ use hyperlocal::UnixConnector;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_util::sync::CancellationToken;
 
-use crate::{primitives::{CompletionReason, YahaHttpVersion}};
+use crate::{
+    primitives::{CompletionReason, YahaHttpVersion},
+    resolver::{OnResolveDns, YahaResolver},
+};
 
-type OnStatusCodeAndHeadersReceive =
+/// The `HttpConnector` type this library always builds: name resolution goes through
+/// [`YahaResolver`] so that an external resolver and the stale-result fallback cache are available
+/// regardless of whether either is configured.
+pub type YahaHttpConnector = HttpConnector<YahaResolver>;
+
+/// How long a cached address stays usable as a fallback after a failed lookup.
+///
+/// Deliberately generous. The cache is only consulted once a lookup has already failed, so the
+/// alternative to a stale address is a hard error; and the case it exists for - an Android app
+/// resuming from the background onto a stale network binding - can easily follow an overnight
+/// pause. See `YetAnotherHttpHandler.DnsCacheFallbackDuration` to change or disable it.
+pub const DEFAULT_DNS_CACHE_FALLBACK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+
+pub type OnStatusCodeAndHeadersReceive =
     extern "C" fn(req_seq: i32, state: NonZeroIsize, status_code: i32, version: YahaHttpVersion);
-type OnReceive = extern "C" fn(req_seq: i32, state: NonZeroIsize, length: usize, buf: *const u8, task_handle: usize);
-type OnComplete = extern "C" fn(req_seq: i32, state: NonZeroIsize, reason: CompletionReason, h2_error_code: u32);
+pub type OnReceive = extern "C" fn(req_seq: i32, state: NonZeroIsize, length: usize, buf: *const u8, task_handle: usize);
+pub type OnComplete = extern "C" fn(req_seq: i32, state: NonZeroIsize, reason: CompletionReason, h2_error_code: u32);
 type OnServerCertificateVerificationHandler = extern "C" fn(callback_state: NonZeroIsize, server_name: *const u8, server_name_len: usize, certificate_der: *const u8, certificate_der_len: usize, now: u64) -> bool;
 
 pub struct YahaNativeRuntimeContext;
@@ -44,7 +60,7 @@ pub struct YahaNativeRuntimeContextInternal {
 
 /// Name given to every tokio worker thread. The managed side matches on this exact string; see
 /// `UnsafeUtilities.WorkerThreadName`. Must stay <= 15 bytes (Linux thread-name limit).
-const WORKER_THREAD_NAME: &str = "yaha-rt-worker";
+pub const WORKER_THREAD_NAME: &str = "yaha-rt-worker";
 
 impl YahaNativeRuntimeContextInternal {
     pub fn from_raw_context(ctx: *mut YahaNativeRuntimeContext) -> &'static mut Self {
@@ -54,13 +70,13 @@ impl YahaNativeRuntimeContextInternal {
         let mut builder = Builder::new_multi_thread();
         let mut builder = builder.enable_all();
 
-        // Name the worker threads explicitly instead of inheriting tokio's default.
+        // Name the worker threads explicitly instead of inheriting tokio's default, so that tests
+        // (and anyone reading a thread dump) can identify them. Relying on tokio's default broke
+        // silently when tokio renamed it from "tokio-runtime-worker" to "tokio-rt-worker"
+        // (tokio #7880); pinning it here keeps that in one place across future tokio releases.
         //
-        // The managed side identifies tokio worker threads by name: UnsafeUtilities
-        // .RequireRunningOnManagedThread fail-fasts if disposal runs on one, and the
-        // SetWorkerThreads test counts them. Relying on tokio's default silently broke both when
-        // tokio renamed it from "tokio-runtime-worker" to "tokio-rt-worker" (tokio #7880). Pinning it
-        // here keeps that contract in one place and survives future tokio releases.
+        // NOTE: this name is no longer load-bearing for correctness. "Am I on a runtime thread?" is
+        // answered by `yaha_is_runtime_thread`, which asks tokio rather than comparing strings.
         //
         // Keep this at 15 bytes or fewer: Linux truncates thread names at 15 (TASK_COMM_LEN - 1),
         // which is the very limit that prompted tokio's rename.
@@ -88,7 +104,9 @@ pub struct YahaNativeContextInternal<'a> {
     pub connect_timeout: Option<Duration>,
     pub client_auth_certificates: Option<Vec<CertificateDer<'a>>>,
     pub client_auth_key: Option<PrivateKeyDer<'a>>,
-    pub tcp_client: Option<Client<HttpsConnector<HttpConnector>, BoxBody<Bytes, hyper::Error>>>,
+    pub tcp_client: Option<Client<HttpsConnector<YahaHttpConnector>, BoxBody<Bytes, hyper::Error>>>,
+    pub dns_resolver_handler: Option<(OnResolveDns, NonZeroIsize)>,
+    pub dns_cache_fallback_duration: Option<Duration>,
     pub on_status_code_and_headers_receive: OnStatusCodeAndHeadersReceive,
     pub on_receive: OnReceive,
     pub on_complete: OnComplete,
@@ -119,6 +137,10 @@ impl YahaNativeContextInternal<'_> {
             root_certificates: None,
             override_server_name: None,
             connect_timeout: None,
+            dns_resolver_handler: None,
+            // Enabled by default: it only ever takes effect once a lookup has already failed.
+            // See `YetAnotherHttpHandler.DnsCacheFallbackDuration` for the rationale.
+            dns_cache_fallback_duration: Some(DEFAULT_DNS_CACHE_FALLBACK_DURATION),
             client_auth_certificates: None,
             client_auth_key: None,
             on_status_code_and_headers_receive,
@@ -151,8 +173,12 @@ impl YahaNativeContextInternal<'_> {
         }
     }
 
+    fn build_resolver(&self) -> YahaResolver {
+        YahaResolver::new(self.dns_resolver_handler, self.dns_cache_fallback_duration)
+    }
+
     #[cfg(feature = "rustls")]
-    fn new_connector(&mut self) -> HttpsConnector<HttpConnector> {
+    fn new_connector(&mut self) -> HttpsConnector<YahaHttpConnector> {
         let tls_config_builder = rustls::ClientConfig::builder();
 
         // Configure certificate root store.
@@ -217,8 +243,8 @@ impl YahaNativeContextInternal<'_> {
         let builder = builder
             .enable_all_versions();
 
-        // Almost the same as `builder.build()`, but specify `set_nodelay(true)`.
-        let mut http_conn = HttpConnector::new();
+        // Almost the same as `builder.build()`, but specify `set_nodelay(true)` and our resolver.
+        let mut http_conn = HttpConnector::new_with_resolver(self.build_resolver());
         http_conn.set_nodelay(true);
         http_conn.enforce_http(false);
         http_conn.set_connect_timeout(self.connect_timeout);
@@ -231,9 +257,63 @@ impl YahaNativeContextInternal<'_> {
         https
     }
 
+    /// Takes an owned snapshot of everything an in-flight request needs from this context.
+    ///
+    /// See [`RequestClient`]: the spawned request task must never borrow the context itself.
+    pub fn request_client(&self) -> RequestClient {
+        RequestClient {
+            on_status_code_and_headers_receive: self.on_status_code_and_headers_receive,
+            on_receive: self.on_receive,
+            on_complete: self.on_complete,
+            tcp_client: self.tcp_client.clone(),
+            #[cfg(unix)]
+            uds_client: self.uds_client.clone(),
+            #[cfg(unix)]
+            uds_socket_path: self.uds_socket_path.clone(),
+        }
+    }
+}
+
+/// An owned snapshot of the parts of [`YahaNativeContextInternal`] that a request needs while it
+/// runs: the three managed callbacks and the hyper client.
+///
+/// The request task must hold one of these rather than a reference to the context. The managed side
+/// can call `yaha_dispose_context` at any time, and that frees the context allocation outright, so a
+/// `&'static mut YahaNativeContextInternal` living inside a spawned task would dangle - and reading
+/// `on_complete` out of freed memory is exactly the kind of native->managed jump that corrupts the
+/// managed heap. Everything here is cheap to clone: the callbacks are plain function pointers and
+/// `Client` is internally reference-counted.
+#[derive(Clone)]
+pub struct RequestClient {
+    pub on_status_code_and_headers_receive: OnStatusCodeAndHeadersReceive,
+    pub on_receive: OnReceive,
+    pub on_complete: OnComplete,
+
+    tcp_client: Option<Client<HttpsConnector<YahaHttpConnector>, BoxBody<Bytes, hyper::Error>>>,
+
+    #[cfg(unix)]
+    uds_client: Option<Client<UnixConnector, BoxBody<Bytes, hyper::Error>>>,
+    #[cfg(unix)]
+    uds_socket_path: Option<std::path::PathBuf>,
+}
+
+impl RequestClient {
+    /// Whether `yaha_build_client` has run. `yaha_request_begin` reports an error to the managed
+    /// side rather than sending when this is false.
+    pub fn has_client(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.tcp_client.is_some() || self.uds_client.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            self.tcp_client.is_some()
+        }
+    }
+
     #[cfg(unix)]
     pub fn request(&self, mut req: Request<BoxBody<Bytes, hyper::Error>>) -> ResponseFuture {
-        // Precondition (`uds_client` or `tcp_client` is set) ensured by `Self::build_client` and `yaha_request_begin`
+        // Precondition (`uds_client` or `tcp_client` is set) ensured by `Self::has_client` and `yaha_request_begin`
         if let Some(uds_socket_path) = &self.uds_socket_path {
             // Transform HTTP URIs to the format expected by hyperlocal
             let path_and_query = req

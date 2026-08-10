@@ -16,6 +16,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="test/YetAnotherHttpHandler.Test/YetAnotherHttpHandler.Test.csproj" />
+    <Project Path="test/YetAnotherHttpHandler.Lifecycle.Test/YetAnotherHttpHandler.Lifecycle.Test.csproj" />
   </Folder>
   <Folder Name="/tests/external/">
     <Project Path="external/HttpClientTestServer/src/HttpClientTestServer.Abstractions/HttpClientTestServer.Abstractions.csproj" />
