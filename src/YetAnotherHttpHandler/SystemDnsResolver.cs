@@ -120,9 +120,12 @@ namespace Cysharp.Net.Http
                     if (inetAddress == null) continue;
                     try
                     {
-                        var bytes = inetAddress.Call<byte[]>("getAddress");
+                        // Java's byte is signed, so the JNI signature has to be built from sbyte.
+                        // Asking for byte[] still works, but Unity warns about it on every single
+                        // address of every single lookup ("using Byte parameters is obsolete").
+                        var bytes = inetAddress.Call<sbyte[]>("getAddress");
                         if (bytes == null) continue;
-                        addresses.Add(ToIPAddress(inetAddress, bytes));
+                        addresses.Add(ToIPAddress(inetAddress, ToUnsigned(bytes)));
                     }
                     finally
                     {
@@ -144,6 +147,13 @@ namespace Cysharp.Net.Http
             {
                 AndroidJNI.DetachCurrentThread();
             }
+        }
+
+        private static byte[] ToUnsigned(sbyte[] bytes)
+        {
+            var unsigned = new byte[bytes.Length];
+            Buffer.BlockCopy(bytes, 0, unsigned, 0, bytes.Length);
+            return unsigned;
         }
 
         private static IPAddress ToIPAddress(AndroidJavaObject inetAddress, byte[] bytes)
